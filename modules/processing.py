@@ -18,7 +18,6 @@ from typing import Any
 import modules.sd_hijack
 from modules import devices, prompt_parser, masking, sd_samplers, lowvram, infotext_utils, extra_networks, sd_vae_approx, scripts, sd_samplers_common, sd_unet, errors, rng, profiling
 from modules.rng import slerp # noqa: F401
-from modules.sd_hijack import model_hijack
 from modules.sd_samplers_common import images_tensor_to_samples, decode_first_stage, approximation_indexes
 from modules.shared import opts, cmd_opts, state
 import modules.shared as shared
@@ -28,8 +27,6 @@ import modules.images as images
 import modules.styles
 import modules.sd_models as sd_models
 import modules.sd_vae as sd_vae
-from ldm.data.util import AddMiDaS
-from ldm.models.diffusion.ddpm import LatentDepth2ImageDiffusion
 
 from einops import repeat, rearrange
 from blendmodes.blend import blendLayers, BlendType
@@ -100,7 +97,7 @@ def create_binary_mask(image, round=True):
     return image
 
 def txt2img_image_conditioning(sd_model, x, width, height):
-    if sd_model.model.conditioning_key in {'hybrid', 'concat'}: # Inpainting models
+    if sd_model.is_inpaint:  # Inpainting models
 
         # The "masked-image" in this case will just be all 0.5 since the entire image is masked.
         image_conditioning = torch.ones(x.shape[0], 3, height, width, device=x.device) * 0.5
@@ -111,24 +108,7 @@ def txt2img_image_conditioning(sd_model, x, width, height):
         image_conditioning = image_conditioning.to(x.dtype)
 
         return image_conditioning
-
-    elif sd_model.model.conditioning_key == "crossattn-adm": # UnCLIP models
-
-        return x.new_zeros(x.shape[0], 2*sd_model.noise_augmentor.time_embed.dim, dtype=x.dtype, device=x.device)
-
     else:
-        if sd_model.is_sdxl_inpaint:
-            # The "masked-image" in this case will just be all 0.5 since the entire image is masked.
-            image_conditioning = torch.ones(x.shape[0], 3, height, width, device=x.device) * 0.5
-            image_conditioning = images_tensor_to_samples(image_conditioning,
-                                                            approximation_indexes.get(opts.sd_vae_encode_method))
-
-            # Add the fake full 1s mask to the first dimension.
-            image_conditioning = torch.nn.functional.pad(image_conditioning, (0, 0, 0, 0, 1, 0), value=1.0)
-            image_conditioning = image_conditioning.to(x.dtype)
-
-            return image_conditioning
-
         # Dummy zero conditioning if we're not using inpainting or unclip models.
         # Still takes up a bit of memory, but no encoder call.
         # Pretty sure we can just make this a 1x1 image since its not going to be used besides its batch size.
@@ -307,28 +287,12 @@ class StableDiffusionProcessing:
         self.comments[text] = 1
 
     def txt2img_image_conditioning(self, x, width=None, height=None):
-        self.is_using_inpainting_conditioning = self.sd_model.model.conditioning_key in {'hybrid', 'concat'}
+        self.is_using_inpainting_conditioning = self.sd_model.is_inpaint
 
         return txt2img_image_conditioning(self.sd_model, x, width or self.width, height or self.height)
 
     def depth2img_image_conditioning(self, source_image):
-        # Use the AddMiDaS helper to Format our source image to suit the MiDaS model
-        transformer = AddMiDaS(model_type="dpt_hybrid")
-        transformed = transformer({"jpg": rearrange(source_image[0], "c h w -> h w c")})
-        midas_in = torch.from_numpy(transformed["midas_in"][None, ...]).to(device=shared.device)
-        midas_in = repeat(midas_in, "1 ... -> n ...", n=self.batch_size)
-
-        conditioning_image = images_tensor_to_samples(source_image*0.5+0.5, approximation_indexes.get(opts.sd_vae_encode_method))
-        conditioning = torch.nn.functional.interpolate(
-            self.sd_model.depth_model(midas_in),
-            size=conditioning_image.shape[2:],
-            mode="bicubic",
-            align_corners=False,
-        )
-
-        (depth_min, depth_max) = torch.aminmax(conditioning)
-        conditioning = 2. * (conditioning - depth_min) / (depth_max - depth_min) - 1.
-        return conditioning
+        raise NotImplementedError('NotImplementedError: depth2img_image_conditioning')
 
     def edit_image_conditioning(self, source_image):
         conditioning_image = shared.sd_model.encode_first_stage(source_image).mode()
@@ -378,29 +342,24 @@ class StableDiffusionProcessing:
         conditioning_mask = torch.nn.functional.interpolate(conditioning_mask, size=latent_image.shape[-2:])
         conditioning_mask = conditioning_mask.expand(conditioning_image.shape[0], -1, -1, -1)
         image_conditioning = torch.cat([conditioning_mask, conditioning_image], dim=1)
-        image_conditioning = image_conditioning.to(shared.device).type(self.sd_model.dtype)
+        # image_conditioning = image_conditioning.to(shared.device).type(self.sd_model.dtype)
 
         return image_conditioning
 
     def img2img_image_conditioning(self, source_image, latent_image, image_mask=None, round_image_mask=True):
         source_image = devices.cond_cast_float(source_image)
 
-        # HACK: Using introspection as the Depth2Image model doesn't appear to uniquely
-        # identify itself with a field common to all models. The conditioning_key is also hybrid.
-        if isinstance(self.sd_model, LatentDepth2ImageDiffusion):
-            return self.depth2img_image_conditioning(source_image)
+        # if self.sd_model.cond_stage_key == "edit":
+        #     return self.edit_image_conditioning(source_image)
 
-        if self.sd_model.cond_stage_key == "edit":
-            return self.edit_image_conditioning(source_image)
-
-        if self.sampler.conditioning_key in {'hybrid', 'concat'}:
+        if self.sd_model.is_inpaint:
             return self.inpainting_image_conditioning(source_image, latent_image, image_mask=image_mask, round_image_mask=round_image_mask)
 
-        if self.sampler.conditioning_key == "crossattn-adm":
-            return self.unclip_image_conditioning(source_image)
-
-        if self.sampler.model_wrap.inner_model.is_sdxl_inpaint:
-            return self.inpainting_image_conditioning(source_image, latent_image, image_mask=image_mask)
+        # if self.sampler.conditioning_key == "crossattn-adm":
+        #     return self.unclip_image_conditioning(source_image)
+        #
+        # if self.sampler.model_wrap.inner_model.is_sdxl_inpaint:
+        #     return self.inpainting_image_conditioning(source_image, latent_image, image_mask=image_mask)
 
         # Dummy zero conditioning if we're not using inpainting or depth model.
         return latent_image.new_zeros(latent_image.shape[0], 5, 1, 1)
@@ -491,19 +450,21 @@ class StableDiffusionProcessing:
         for cache in caches:
             if cache[0] is not None and cached_params == cache[0]:
                 if len(cache) > 2:
-                    modules.sd_hijack.model_hijack.extra_generation_params.update(cache[2])
+                    shared.sd_model.extra_generation_params.update(cache[2])
                 return cache[1]
 
         cache = caches[0]
 
         with devices.autocast():
+            shared.sd_model.set_clip_skip(opts.CLIP_stop_at_last_layers)
+
             cache[1] = function(shared.sd_model, required_prompts, steps, hires_steps, shared.opts.use_old_scheduling)
 
             import backend.text_processing.classic_engine
 
             last_extra_generation_params = backend.text_processing.classic_engine.last_extra_generation_params.copy()
 
-            modules.sd_hijack.model_hijack.extra_generation_params.update(last_extra_generation_params)
+            shared.sd_model.extra_generation_params.update(last_extra_generation_params)
 
             if len(cache) > 2:
                 cache[2] = last_extra_generation_params
@@ -873,7 +834,8 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     p.sd_vae_hash = sd_vae.get_loaded_vae_hash()
 
     apply_circular_forge(p.sd_model, p.tiling)
-    modules.sd_hijack.model_hijack.clear_comments()
+    p.sd_model.comments = []
+    p.sd_model.extra_generation_params = {}
 
     p.fill_fields_from_opts()
     p.setup_prompts()
@@ -928,7 +890,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             p.seeds = p.all_seeds[n * p.batch_size:(n + 1) * p.batch_size]
             p.subseeds = p.all_subseeds[n * p.batch_size:(n + 1) * p.batch_size]
 
-            latent_channels = getattr(shared.sd_model, 'latent_channels', opt_C)
+            latent_channels = shared.sd_model.forge_objects.vae.latent_channels
             p.rng = rng.ImageRNG((latent_channels, p.height // opt_f, p.width // opt_f), p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, seed_resize_from_h=p.seed_resize_from_h, seed_resize_from_w=p.seed_resize_from_w)
 
             if p.scripts is not None:
@@ -949,7 +911,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
             p.setup_conds()
 
-            p.extra_generation_params.update(model_hijack.extra_generation_params)
+            p.extra_generation_params.update(p.sd_model.extra_generation_params)
 
             # params.txt should be saved after scripts.process_batch, since the
             # infotext could be modified by that callback
@@ -960,7 +922,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                     processed = Processed(p, [])
                     file.write(processed.infotext(p, 0))
 
-            for comment in model_hijack.comments:
+            for comment in p.sd_model.comments:
                 p.comment(comment)
 
             if p.n_iter > 1:
@@ -1540,8 +1502,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         if self.enable_hr and self.hr_checkpoint_info is None:
             if shared.opts.hires_fix_use_firstpass_conds:
                 self.calculate_hr_conds()
-
-            elif shared.sd_model.sd_checkpoint_info == sd_models.select_checkpoint():  # if in lowvram mode, we need to calculate conds right away, before the cond NN is unloaded
+            else:
                 with devices.autocast():
                     extra_networks.activate(self, self.hr_extra_network_data)
 
@@ -1617,7 +1578,7 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
     def init(self, all_prompts, all_seeds, all_subseeds):
         self.extra_generation_params["Denoising strength"] = self.denoising_strength
 
-        self.image_cfg_scale: float = self.image_cfg_scale if shared.sd_model.cond_stage_key == "edit" else None
+        self.image_cfg_scale: float = None
 
         self.sampler = sd_samplers.create_sampler(self.sampler_name, self.sd_model)
         crop_region = None
@@ -1666,7 +1627,7 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
                     self.mask_for_overlay = None
                     self.inpaint_full_res = False
                     massage = 'Unable to perform "Inpaint Only mask" because mask is blank, switch to img2img mode.'
-                    model_hijack.comments.append(massage)
+                    self.sd_model.comments.append(massage)
                     logging.info(massage)
             else:
                 image_mask = images.resize_image(self.resize_mode, image_mask, self.width, self.height)

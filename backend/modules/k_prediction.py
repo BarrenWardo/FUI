@@ -108,11 +108,11 @@ class Prediction(AbstractPrediction):
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         sigmas = ((1 - alphas_cumprod) / alphas_cumprod) ** 0.5
-        self.set_sigmas(sigmas)
 
-    def set_sigmas(self, sigmas):
+        self.register_buffer('alphas_cumprod', alphas_cumprod.float())
         self.register_buffer('sigmas', sigmas.float())
         self.register_buffer('log_sigmas', sigmas.log().float())
+        return
 
     @property
     def sigma_min(self):
@@ -228,7 +228,7 @@ class PredictionFlow(AbstractPrediction):
 
 
 class PredictionFlux(AbstractPrediction):
-    def __init__(self, sigma_data=1.0, prediction_type='eps', shift=1.0, timesteps=10000):
+    def __init__(self, sigma_data=1.0, prediction_type='const', shift=1.15, timesteps=10000):
         super().__init__(sigma_data=sigma_data, prediction_type=prediction_type)
         self.shift = shift
         ts = self.sigma((torch.arange(1, timesteps + 1, 1) / timesteps))

@@ -1,12 +1,25 @@
 import copy
 import torch
 
+from backend.modules.k_model import KModel
 from backend.patcher.base import ModelPatcher
+from backend import memory_management
 
 
 class UnetPatcher(ModelPatcher):
-    def __init__(self, model, *args, **kwargs):
-        super().__init__(model, *args, **kwargs)
+    @classmethod
+    def from_model(cls, model, diffusers_scheduler, config, k_predictor=None):
+        parameters = memory_management.module_size(model)
+        unet_dtype = memory_management.unet_dtype(model_params=parameters)
+        load_device = memory_management.get_torch_device()
+        initial_load_device = memory_management.unet_inital_load_device(parameters, unet_dtype)
+        computation_dtype = memory_management.get_computation_dtype(load_device, supported_dtypes=config.supported_inference_dtypes)
+        model.to(device=initial_load_device, dtype=unet_dtype)
+        model = KModel(model=model, diffusers_scheduler=diffusers_scheduler, k_predictor=k_predictor, storage_dtype=unet_dtype, computation_dtype=computation_dtype)
+        return UnetPatcher(model, load_device=load_device, offload_device=memory_management.unet_offload_device(), current_device=initial_load_device)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.controlnet_linked_list = None
         self.extra_preserved_memory_during_sampling = 0
         self.extra_model_patchers_during_sampling = []

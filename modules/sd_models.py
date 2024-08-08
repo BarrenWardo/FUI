@@ -10,15 +10,17 @@ import re
 import safetensors.torch
 from omegaconf import OmegaConf, ListConfig
 from urllib import request
-import ldm.modules.midas as midas
 import gc
+import contextlib
 
 from modules import paths, shared, modelloader, devices, script_callbacks, sd_vae, sd_disable_initialization, errors, hashes, sd_models_config, sd_unet, sd_models_xl, cache, extra_networks, processing, lowvram, sd_hijack, patches
-from modules.shared import opts
+from modules.shared import opts, cmd_opts
 from modules.timer import Timer
 import numpy as np
-from modules_forge import loader
+from backend.loader import forge_loader
 from backend import memory_management
+from backend.args import dynamic_args
+from backend.utils import load_torch_file
 
 
 model_dir = "Stable-diffusion"
@@ -131,13 +133,13 @@ class CheckpointInfo:
         return self.shorthash
 
 
-try:
-    # this silences the annoying "Some weights of the model checkpoint were not used when initializing..." message at start.
-    from transformers import logging, CLIPModel  # noqa: F401
-
-    logging.set_verbosity_error()
-except Exception:
-    pass
+# try:
+#     # this silences the annoying "Some weights of the model checkpoint were not used when initializing..." message at start.
+#     from transformers import logging, CLIPModel  # noqa: F401
+#
+#     logging.set_verbosity_error()
+# except Exception:
+#     pass
 
 
 def setup_model():
@@ -242,45 +244,12 @@ def select_checkpoint():
     return checkpoint_info
 
 
-checkpoint_dict_replacements_sd1 = {
-    'cond_stage_model.transformer.embeddings.': 'cond_stage_model.transformer.text_model.embeddings.',
-    'cond_stage_model.transformer.encoder.': 'cond_stage_model.transformer.text_model.encoder.',
-    'cond_stage_model.transformer.final_layer_norm.': 'cond_stage_model.transformer.text_model.final_layer_norm.',
-}
-
-checkpoint_dict_replacements_sd2_turbo = { # Converts SD 2.1 Turbo from SGM to LDM format.
-    'conditioner.embedders.0.': 'cond_stage_model.',
-}
-
-
 def transform_checkpoint_dict_key(k, replacements):
-    for text, replacement in replacements.items():
-        if k.startswith(text):
-            k = replacement + k[len(text):]
-
-    return k
+    pass
 
 
 def get_state_dict_from_checkpoint(pl_sd):
-    pl_sd = pl_sd.pop("state_dict", pl_sd)
-    pl_sd.pop("state_dict", None)
-
-    is_sd2_turbo = 'conditioner.embedders.0.model.ln_final.weight' in pl_sd and pl_sd['conditioner.embedders.0.model.ln_final.weight'].size()[0] == 1024
-
-    sd = {}
-    for k, v in pl_sd.items():
-        if is_sd2_turbo:
-            new_key = transform_checkpoint_dict_key(k, checkpoint_dict_replacements_sd2_turbo)
-        else:
-            new_key = transform_checkpoint_dict_key(k, checkpoint_dict_replacements_sd1)
-
-        if new_key is not None:
-            sd[new_key] = v
-
-    pl_sd.clear()
-    pl_sd.update(sd)
-
-    return pl_sd
+    pass
 
 
 def read_metadata_from_safetensors(filename):
@@ -312,23 +281,7 @@ def read_metadata_from_safetensors(filename):
 
 
 def read_state_dict(checkpoint_file, print_global_state=False, map_location=None):
-    _, extension = os.path.splitext(checkpoint_file)
-    if extension.lower() == ".safetensors":
-        device = map_location or shared.weight_load_location or devices.get_optimal_device_name()
-
-        if not shared.opts.disable_mmap_load_safetensors:
-            pl_sd = safetensors.torch.load_file(checkpoint_file, device=device)
-        else:
-            pl_sd = safetensors.torch.load(open(checkpoint_file, 'rb').read())
-            pl_sd = {k: v.to(device) for k, v in pl_sd.items()}
-    else:
-        pl_sd = torch.load(checkpoint_file, map_location=map_location or shared.weight_load_location)
-
-    if print_global_state and "global_step" in pl_sd:
-        print(f"Global Step: {pl_sd['global_step']}")
-
-    sd = get_state_dict_from_checkpoint(pl_sd)
-    return sd
+    pass
 
 
 def get_checkpoint_state_dict(checkpoint_info: CheckpointInfo, timer):
@@ -343,160 +296,42 @@ def get_checkpoint_state_dict(checkpoint_info: CheckpointInfo, timer):
         return checkpoints_loaded[checkpoint_info]
 
     print(f"Loading weights [{sd_model_hash}] from {checkpoint_info.filename}")
-    res = read_state_dict(checkpoint_info.filename)
+    res = load_torch_file(checkpoint_info.filename)
     timer.record("load weights from disk")
 
     return res
 
 
-class SkipWritingToConfig:
-    """This context manager prevents load_model_weights from writing checkpoint name to the config when it loads weight."""
-
-    skip = False
-    previous = None
-
-    def __enter__(self):
-        self.previous = SkipWritingToConfig.skip
-        SkipWritingToConfig.skip = True
-        return self
-
-    def __exit__(self, exc_type, exc_value, exc_traceback):
-        SkipWritingToConfig.skip = self.previous
+def SkipWritingToConfig():
+    return contextlib.nullcontext()
 
 
 def check_fp8(model):
-    if model is None:
-        return None
-    if devices.get_optimal_device_name() == "mps":
-        enable_fp8 = False
-    elif shared.opts.fp8_storage == "Enable":
-        enable_fp8 = True
-    elif getattr(model, "is_sdxl", False) and shared.opts.fp8_storage == "Enable for SDXL":
-        enable_fp8 = True
-    else:
-        enable_fp8 = False
-    return enable_fp8
+    pass
 
 
 def set_model_type(model, state_dict):
-    model.is_sd1 = False
-    model.is_sd2 = False
-    model.is_sdxl = False
-    model.is_ssd = False
-    model.is_sd3 = False
-
-    if "model.diffusion_model.x_embedder.proj.weight" in state_dict:
-        model.is_sd3 = True
-        model.model_type = ModelType.SD3
-    elif hasattr(model, 'conditioner'):
-        model.is_sdxl = True
-
-        if 'model.diffusion_model.middle_block.1.transformer_blocks.0.attn1.to_q.weight' not in state_dict.keys():
-            model.is_ssd = True
-            model.model_type = ModelType.SSD
-        else:
-            model.model_type = ModelType.SDXL
-    elif hasattr(model.cond_stage_model, 'model'):
-        model.is_sd2 = True
-        model.model_type = ModelType.SD2
-    else:
-        model.is_sd1 = True
-        model.model_type = ModelType.SD1
+    pass
 
 
 def set_model_fields(model):
-    if not hasattr(model, 'latent_channels'):
-        model.latent_channels = 4
+    pass
 
 
 def load_model_weights(model, checkpoint_info: CheckpointInfo, state_dict, timer):
-    return
+    pass
 
 
 def enable_midas_autodownload():
-    """
-    Gives the ldm.modules.midas.api.load_model function automatic downloading.
-
-    When the 512-depth-ema model, and other future models like it, is loaded,
-    it calls midas.api.load_model to load the associated midas depth model.
-    This function applies a wrapper to download the model to the correct
-    location automatically.
-    """
-
-    midas_path = os.path.join(paths.models_path, 'midas')
-
-    # stable-diffusion-stability-ai hard-codes the midas model path to
-    # a location that differs from where other scripts using this model look.
-    # HACK: Overriding the path here.
-    for k, v in midas.api.ISL_PATHS.items():
-        file_name = os.path.basename(v)
-        midas.api.ISL_PATHS[k] = os.path.join(midas_path, file_name)
-
-    midas_urls = {
-        "dpt_large": "https://github.com/intel-isl/DPT/releases/download/1_0/dpt_large-midas-2f21e586.pt",
-        "dpt_hybrid": "https://github.com/intel-isl/DPT/releases/download/1_0/dpt_hybrid-midas-501f0c75.pt",
-        "midas_v21": "https://github.com/AlexeyAB/MiDaS/releases/download/midas_dpt/midas_v21-f6b98070.pt",
-        "midas_v21_small": "https://github.com/AlexeyAB/MiDaS/releases/download/midas_dpt/midas_v21_small-70d6b9c8.pt",
-    }
-
-    midas.api.load_model_inner = midas.api.load_model
-
-    def load_model_wrapper(model_type):
-        path = midas.api.ISL_PATHS[model_type]
-        if not os.path.exists(path):
-            if not os.path.exists(midas_path):
-                os.mkdir(midas_path)
-
-            print(f"Downloading midas model weights for {model_type} to {path}")
-            request.urlretrieve(midas_urls[model_type], path)
-            print(f"{model_type} downloaded")
-
-        return midas.api.load_model_inner(model_type)
-
-    midas.api.load_model = load_model_wrapper
+    pass
 
 
 def patch_given_betas():
-    import ldm.models.diffusion.ddpm
-
-    def patched_register_schedule(*args, **kwargs):
-        """a modified version of register_schedule function that converts plain list from Omegaconf into numpy"""
-
-        if isinstance(args[1], ListConfig):
-            args = (args[0], np.array(args[1]), *args[2:])
-
-        original_register_schedule(*args, **kwargs)
-
-    original_register_schedule = patches.patch(__name__, ldm.models.diffusion.ddpm.DDPM, 'register_schedule', patched_register_schedule)
+    pass
 
 
 def repair_config(sd_config, state_dict=None):
-    if not hasattr(sd_config.model.params, "use_ema"):
-        sd_config.model.params.use_ema = False
-
-    if hasattr(sd_config.model.params, 'unet_config'):
-        if shared.cmd_opts.no_half:
-            sd_config.model.params.unet_config.params.use_fp16 = False
-        elif shared.cmd_opts.upcast_sampling or shared.cmd_opts.precision == "half":
-            sd_config.model.params.unet_config.params.use_fp16 = True
-
-    if hasattr(sd_config.model.params, 'first_stage_config'):
-        if getattr(sd_config.model.params.first_stage_config.params.ddconfig, "attn_type", None) == "vanilla-xformers" and not shared.xformers_available:
-            sd_config.model.params.first_stage_config.params.ddconfig.attn_type = "vanilla"
-
-    # For UnCLIP-L, override the hardcoded karlo directory
-    if hasattr(sd_config.model.params, "noise_aug_config") and hasattr(sd_config.model.params.noise_aug_config.params, "clip_stats_path"):
-        karlo_path = os.path.join(paths.models_path, 'karlo')
-        sd_config.model.params.noise_aug_config.params.clip_stats_path = sd_config.model.params.noise_aug_config.params.clip_stats_path.replace("checkpoints/karlo_models", karlo_path)
-
-    # Do not use checkpoint for inference.
-    # This helps prevent extra performance overhead on checking parameters.
-    # The perf overhead is about 100ms/it on 4090 for SDXL.
-    if hasattr(sd_config.model.params, "network_config"):
-        sd_config.model.params.network_config.params.use_checkpoint = False
-    if hasattr(sd_config.model.params, "unet_config"):
-        sd_config.model.params.unet_config.params.use_checkpoint = False
-
+    pass
 
 
 def rescale_zero_terminal_snr_abar(alphas_cumprod):
@@ -541,36 +376,15 @@ def apply_alpha_schedule_override(sd_model, p=None):
         sd_model.alphas_cumprod = rescale_zero_terminal_snr_abar(sd_model.alphas_cumprod).to(shared.device)
 
 
-sd1_clip_weight = 'cond_stage_model.transformer.text_model.embeddings.token_embedding.weight'
-sd2_clip_weight = 'cond_stage_model.model.transformer.resblocks.0.attn.in_proj_weight'
-sdxl_clip_weight = 'conditioner.embedders.1.model.ln_final.weight'
-sdxl_refiner_clip_weight = 'conditioner.embedders.0.model.ln_final.weight'
-
-
 class SdModelData:
     def __init__(self):
         self.sd_model = None
         self.loaded_sd_models = []
         self.was_loaded_at_least_once = False
-        self.lock = threading.Lock()
 
     def get_sd_model(self):
-        if self.was_loaded_at_least_once:
-            return self.sd_model
-
         if self.sd_model is None:
-            with self.lock:
-                if self.sd_model is not None or self.was_loaded_at_least_once:
-                    return self.sd_model
-
-                try:
-                    load_model()
-
-                except Exception as e:
-                    errors.display(e, "loading stable diffusion model", full_traceback=True)
-                    print("", file=sys.stderr)
-                    print("Stable diffusion model failed to load", file=sys.stderr)
-                    self.sd_model = None
+            raise ValueError('Something went wrong! Model is not loaded yet ...')
 
         return self.sd_model
 
@@ -586,19 +400,7 @@ model_data = SdModelData()
 
 
 def get_empty_cond(sd_model):
-
-    p = processing.StableDiffusionProcessingTxt2Img()
-    extra_networks.activate(p, {})
-
-    if hasattr(sd_model, 'get_learned_conditioning'):
-        d = sd_model.get_learned_conditioning([""])
-    else:
-        d = sd_model.cond_stage_model([""])
-
-    if isinstance(d, dict):
-        d = d['crossattn']
-
-    return d
+    pass
 
 
 def send_model_to_cpu(m):
@@ -618,34 +420,52 @@ def send_model_to_trash(m):
 
 
 def instantiate_from_config(config, state_dict=None):
-    constructor = get_obj_from_str(config["target"])
-
-    params = {**config.get("params", {})}
-
-    if state_dict and "state_dict" in params and params["state_dict"] is None:
-        params["state_dict"] = state_dict
-
-    return constructor(**params)
+    pass
 
 
 def get_obj_from_str(string, reload=False):
-    module, cls = string.rsplit(".", 1)
-    if reload:
-        module_imp = importlib.import_module(module)
-        importlib.reload(module_imp)
-    return getattr(importlib.import_module(module, package=None), cls)
+    pass
 
 
 def load_model(checkpoint_info=None, already_loaded_state_dict=None):
-    from modules import sd_hijack
-    checkpoint_info = checkpoint_info or select_checkpoint()
+    pass
+
+
+def reuse_model_from_already_loaded(sd_model, checkpoint_info, timer):
+    pass
+
+
+def reload_model_weights(sd_model=None, info=None, forced_reload=False):
+    pass
+
+
+def unload_model_weights(sd_model=None, info=None):
+    pass
+
+
+def apply_token_merging(sd_model, token_merging_ratio):
+    if token_merging_ratio <= 0:
+        return
+
+    print(f'token_merging_ratio = {token_merging_ratio}')
+
+    from backend.misc.tomesd import TomePatcher
+
+    sd_model.forge_objects.unet = TomePatcher().patch(
+        model=sd_model.forge_objects.unet,
+        ratio=token_merging_ratio
+    )
+
+    return
+
+
+@torch.no_grad()
+def forge_model_reload():
+    checkpoint_info = select_checkpoint()
 
     timer = Timer()
 
     if model_data.sd_model:
-        if model_data.sd_model.filename == checkpoint_info.filename:
-            return model_data.sd_model
-
         model_data.sd_model = None
         model_data.loaded_sd_models = []
         memory_management.unload_all_models()
@@ -654,20 +474,23 @@ def load_model(checkpoint_info=None, already_loaded_state_dict=None):
 
     timer.record("unload existing model")
 
-    if already_loaded_state_dict is not None:
-        state_dict = already_loaded_state_dict
-    else:
-        state_dict = get_checkpoint_state_dict(checkpoint_info, timer)
+    state_dict = get_checkpoint_state_dict(checkpoint_info, timer)
 
     if shared.opts.sd_checkpoint_cache > 0:
         # cache newly loaded model
         checkpoints_loaded[checkpoint_info] = state_dict.copy()
 
-    sd_model = loader.load_model_for_a1111(timer=timer, checkpoint_info=checkpoint_info, state_dict=state_dict)
-    sd_model.filename = checkpoint_info.filename
+    dynamic_args['embedding_dir'] = cmd_opts.embeddings_dir
+    dynamic_args['emphasis_name'] = opts.emphasis
+    sd_model = forge_loader(state_dict)
+    timer.record("forge model load")
 
-    if not SkipWritingToConfig.skip:
-        shared.opts.data["sd_model_checkpoint"] = checkpoint_info.title
+    sd_model.extra_generation_params = {}
+    sd_model.comments = []
+    sd_model.sd_checkpoint_info = checkpoint_info
+    sd_model.filename = checkpoint_info.filename
+    sd_model.sd_model_hash = checkpoint_info.calculate_shorthash()
+    timer.record("calculate hash")
 
     del state_dict
 
@@ -693,31 +516,3 @@ def load_model(checkpoint_info=None, already_loaded_state_dict=None):
     print(f"Model loaded in {timer.summary()}.")
 
     return sd_model
-
-
-def reuse_model_from_already_loaded(sd_model, checkpoint_info, timer):
-    pass
-
-
-def reload_model_weights(sd_model=None, info=None, forced_reload=False):
-    return load_model(info)
-
-
-def unload_model_weights(sd_model=None, info=None):
-    return sd_model
-
-
-def apply_token_merging(sd_model, token_merging_ratio):
-    if token_merging_ratio <= 0:
-        return
-
-    print(f'token_merging_ratio = {token_merging_ratio}')
-
-    from backend.misc.tomesd import TomePatcher
-
-    sd_model.forge_objects.unet = TomePatcher().patch(
-        model=sd_model.forge_objects.unet,
-        ratio=token_merging_ratio
-    )
-
-    return

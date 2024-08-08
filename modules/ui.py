@@ -24,9 +24,9 @@ from modules.shared import opts, cmd_opts
 import modules.infotext_utils as parameters_copypaste
 import modules.shared as shared
 from modules import prompt_parser
-from modules.sd_hijack import model_hijack
 from modules.infotext_utils import image_from_url_text, PasteField
 from modules_forge.forge_canvas.canvas import ForgeCanvas, canvas_head
+from modules_forge import main_entry
 
 
 create_setting_component = ui_settings.create_setting_component
@@ -181,14 +181,14 @@ def update_token_counter(text, steps, styles, *, is_positive=True):
         prompt_schedules = [[[steps, text]]]
 
     try:
-        cond_stage_model = sd_models.model_data.sd_model.cond_stage_model
-        assert cond_stage_model is not None
+        get_prompt_lengths_on_ui = sd_models.model_data.sd_model.get_prompt_lengths_on_ui
+        assert get_prompt_lengths_on_ui is not None
     except Exception:
         return f"<span class='gr-box gr-text-input'>?/?</span>"
 
     flat_prompts = reduce(lambda list1, list2: list1+list2, prompt_schedules)
     prompts = [prompt_text for step, prompt_text in flat_prompts]
-    token_count, max_length = max([model_hijack.get_prompt_lengths(prompt, cond_stage_model) for prompt in prompts], key=lambda args: args[0])
+    token_count, max_length = max([get_prompt_lengths_on_ui(prompt) for prompt in prompts], key=lambda args: args[0])
     return f"<span class='gr-box gr-text-input'>{token_count}/{max_length}</span>"
 
 
@@ -329,15 +329,15 @@ def create_ui():
                                     hr_resize_x = gr.Slider(minimum=0, maximum=2048, step=8, label="Resize width to", value=0, elem_id="txt2img_hr_resize_x")
                                     hr_resize_y = gr.Slider(minimum=0, maximum=2048, step=8, label="Resize height to", value=0, elem_id="txt2img_hr_resize_y")
 
-                                with FormRow(elem_id="txt2img_hires_fix_row3", variant="compact", visible=opts.hires_fix_show_sampler) as hr_sampler_container:
+                                with FormRow(elem_id="txt2img_hires_fix_row3", variant="compact") as hr_sampler_container:
 
-                                    hr_checkpoint_name = gr.Dropdown(label='Checkpoint', elem_id="hr_checkpoint", choices=["Use same checkpoint"] + modules.sd_models.checkpoint_tiles(use_short=True), value="Use same checkpoint")
-                                    create_refresh_button(hr_checkpoint_name, modules.sd_models.list_models, lambda: {"choices": ["Use same checkpoint"] + modules.sd_models.checkpoint_tiles(use_short=True)}, "hr_checkpoint_refresh")
+                                    hr_checkpoint_name = gr.Dropdown(label='Checkpoint', elem_id="hr_checkpoint", choices=["Use same checkpoint"], value="Use same checkpoint", visible=False, interactive=False)
+                                    # create_refresh_button(hr_checkpoint_name, modules.sd_models.list_models, lambda: {"choices": ["Use same checkpoint"] + modules.sd_models.checkpoint_tiles(use_short=True)}, "hr_checkpoint_refresh")
 
                                     hr_sampler_name = gr.Dropdown(label='Hires sampling method', elem_id="hr_sampler", choices=["Use same sampler"] + sd_samplers.visible_sampler_names(), value="Use same sampler")
                                     hr_scheduler = gr.Dropdown(label='Hires schedule type', elem_id="hr_scheduler", choices=["Use same scheduler"] + [x.label for x in sd_schedulers.schedulers], value="Use same scheduler")
 
-                                with FormRow(elem_id="txt2img_hires_fix_row4", variant="compact", visible=opts.hires_fix_show_prompts) as hr_prompts_container:
+                                with FormRow(elem_id="txt2img_hires_fix_row4", variant="compact") as hr_prompts_container:
                                     with gr.Column(scale=80):
                                         with gr.Row():
                                             hr_prompt = gr.Textbox(label="Hires prompt", elem_id="hires_prompt", show_label=False, lines=3, placeholder="Prompt for hires fix pass.\nLeave empty to use the same prompt as in first pass.", elem_classes=["prompt"])
@@ -890,8 +890,8 @@ def create_ui():
     settings.create_ui(loadsave, dummy_component)
 
     interfaces = [
-        (txt2img_interface, "txt2img", "txt2img"),
-        (img2img_interface, "img2img", "img2img"),
+        (txt2img_interface, "Txt2img", "txt2img"),
+        (img2img_interface, "Img2img", "img2img"),
         (extras_interface, "Extras", "extras"),
         (pnginfo_interface, "PNG Info", "pnginfo"),
         (modelmerger_ui.blocks, "Checkpoint Merger", "modelmerger"),
@@ -938,11 +938,13 @@ def create_ui():
 
         settings.add_functionality(demo)
 
-        update_image_cfg_scale_visibility = lambda: gr.update(visible=shared.sd_model and shared.sd_model.cond_stage_key == "edit")
+        update_image_cfg_scale_visibility = lambda: gr.update(visible=False)
         settings.text_settings.change(fn=update_image_cfg_scale_visibility, inputs=[], outputs=[image_cfg_scale])
         demo.load(fn=update_image_cfg_scale_visibility, inputs=[], outputs=[image_cfg_scale])
 
-        modelmerger_ui.setup_ui(dummy_component=dummy_component, sd_model_checkpoint_component=settings.component_dict['sd_model_checkpoint'])
+        modelmerger_ui.setup_ui(dummy_component=dummy_component, sd_model_checkpoint_component=main_entry.ui_checkpoint)
+
+        main_entry.forge_main_entry()
 
     if ui_settings_from_file != loadsave.ui_settings:
         loadsave.dump_defaults()

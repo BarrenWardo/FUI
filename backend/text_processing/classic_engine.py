@@ -4,6 +4,7 @@ import torch
 from collections import namedtuple
 from backend.text_processing import parsing, emphasis
 from backend.text_processing.textual_inversion import EmbeddingDatabase
+from backend import memory_management
 
 
 PromptChunkFix = namedtuple('PromptChunkFix', ['offset', 'embedding'])
@@ -47,11 +48,12 @@ class CLIPEmbeddingForTextualInversion(torch.nn.Module):
         return torch.stack(vecs)
 
 
-class ClassicTextProcessingEngine(torch.nn.Module):
-    def __init__(self, text_encoder, tokenizer, chunk_length=75,
-                 embedding_dir=None, embedding_key='clip_l', embedding_expected_shape=768, emphasis_name="original",
-                 text_projection=False, minimal_clip_skip=1, clip_skip=1, return_pooled=False, final_layer_norm=True,
-                 callback_before_encode=None):
+class ClassicTextProcessingEngine:
+    def __init__(
+            self, text_encoder, tokenizer, chunk_length=75,
+            embedding_dir=None, embedding_key='clip_l', embedding_expected_shape=768, emphasis_name="Original",
+            text_projection=False, minimal_clip_skip=1, clip_skip=1, return_pooled=False, final_layer_norm=True
+    ):
         super().__init__()
 
         self.embeddings = EmbeddingDatabase(tokenizer, embedding_expected_shape)
@@ -71,7 +73,6 @@ class ClassicTextProcessingEngine(torch.nn.Module):
         self.clip_skip = clip_skip
         self.return_pooled = return_pooled
         self.final_layer_norm = final_layer_norm
-        self.callback_before_encode = callback_before_encode
 
         self.chunk_length = chunk_length
 
@@ -119,7 +120,9 @@ class ClassicTextProcessingEngine(torch.nn.Module):
         return tokenized
 
     def encode_with_transformers(self, tokens):
-        tokens = tokens.to(self.text_encoder.transformer.text_model.embeddings.token_embedding.weight.device)
+        target_device = memory_management.get_torch_device()
+        self.text_encoder.transformer.text_model.embeddings.position_ids = self.text_encoder.transformer.text_model.embeddings.position_ids.to(device=target_device)
+        tokens = tokens.to(target_device)
 
         outputs = self.text_encoder.transformer(tokens, output_hidden_states=True)
 
@@ -133,7 +136,7 @@ class ClassicTextProcessingEngine(torch.nn.Module):
             pooled_output = outputs.pooler_output
 
             if self.text_projection:
-                pooled_output = pooled_output.float().to(self.text_encoder.text_projection.device) @ self.text_encoder.text_projection.float()
+                pooled_output = self.text_encoder.transformer.text_projection(pooled_output)
 
             z.pooled = pooled_output
         return z
@@ -240,10 +243,7 @@ class ClassicTextProcessingEngine(torch.nn.Module):
 
         return batch_chunks, token_count
 
-    def forward(self, texts):
-        if self.callback_before_encode is not None:
-            self.callback_before_encode(self, texts)
-
+    def __call__(self, texts):
         batch_chunks, token_count = self.process_texts(texts)
 
         used_embeddings = {}
